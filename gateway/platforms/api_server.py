@@ -579,6 +579,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # Configured via extra.scope_deny_keywords in config.yaml (list of strings).
         _raw_deny = extra.get("scope_deny_keywords", [])
         self._scope_deny_keywords: list = [k.lower().strip() for k in _raw_deny if k and isinstance(k, str)]
+        # UID allowlist: Telegram user_ids permitted to call /v1/* endpoints.
+        # Configured via extra.allowed_user_ids in config.yaml (list of int/str).
+        # When empty, UID guard is DISABLED (pre-launch / no UID known yet).
+        # CRIT-A (Fix-155): enforce x-telegram-user-id header against this list.
+        _raw_uids = extra.get("allowed_user_ids", [])
+        self._allowed_user_ids: frozenset = frozenset(
+            str(uid).strip() for uid in _raw_uids if str(uid).strip()
+        )
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -690,6 +698,50 @@ class APIServerAdapter(BasePlatformAdapter):
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
         )
+
+    def _check_uid(self, request: "web.Request") -> "Optional[web.Response]":
+        """
+        Validate x-telegram-user-id header against allowed_user_ids allowlist.
+
+        Returns None if UID is OK (or guard disabled), 403 web.Response on mismatch.
+        Guard is DISABLED (returns None) when self._allowed_user_ids is empty —
+        this covers the pre-launch phase where Miranda's real UID is not yet known.
+        Set extra.allowed_user_ids in config.yaml to enable enforcement.
+
+        CRIT-A (Fix-155, 2026-05-12): closes the API-path UID bypass.
+        """
+        if not self._allowed_user_ids:
+            # Guard disabled — allowlist is empty (pre-launch or unconfigured).
+            return None
+
+        uid_header = request.headers.get("x-telegram-user-id", "").strip()
+        if not uid_header:
+            logger.warning("UID guard: missing x-telegram-user-id header — rejecting")
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "Missing x-telegram-user-id header",
+                        "type": "permission_denied",
+                        "code": "uid_required",
+                    }
+                },
+                status=403,
+            )
+
+        if uid_header not in self._allowed_user_ids:
+            logger.warning("UID guard: x-telegram-user-id %r not in allowlist — rejecting", uid_header)
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "UID not permitted for this profile",
+                        "type": "permission_denied",
+                        "code": "uid_not_allowed",
+                    }
+                },
+                status=403,
+            )
+
+        return None  # UID validated
 
     # ------------------------------------------------------------------
     # Session DB helper
@@ -1175,6 +1227,11 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+
+        # CRIT-A (Fix-155): per-request UID guard.
+        uid_err = self._check_uid(request)
+        if uid_err:
+            return uid_err
 
         # Parse request body
         try:
@@ -2089,6 +2146,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        # CRIT-A (Fix-155): per-request UID guard.
+        uid_err = self._check_uid(request)
+        if uid_err:
+            return uid_err
+
         # Parse request body
         try:
             body = await request.json()
@@ -2778,6 +2840,11 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+
+        # CRIT-A (Fix-155): per-request UID guard.
+        uid_err = self._check_uid(request)
+        if uid_err:
+            return uid_err
 
         # Enforce concurrency limit
         if len(self._run_streams) >= self._MAX_CONCURRENT_RUNS:
