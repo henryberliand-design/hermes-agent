@@ -947,6 +947,133 @@ class APIServerAdapter(BasePlatformAdapter):
         result = [dict(zip(cols, r)) for r in rows]
         return web.json_response({"errors": result, "count": len(result)})
 
+    async def _handle_errors_summary_get(self, request: "web.Request") -> "web.Response":
+        """GET /errors/summary?since=<ISO>&severity=<level> — aggregated error stats.
+
+        No auth required (same policy as GET /errors — internal/CF-Access gates public face).
+
+        Query params:
+          since    ISO-8601 datetime (default: last 24 h)
+          severity filter: info | warn | error | critical (omit for all)
+
+        Returns:
+          {
+            "window":  {"since": "...", "until": "..."},
+            "totals":  {"info": N, "warn": N, "error": N, "critical": N},
+            "by_service": {"<service>": {"info": N, ...}, ...},
+            "top_recent": [<3–5 most-recent critical/error rows>],
+            "alert_rate_per_hour": <float>
+          }
+
+        Consumer: soak-charter §2d Ares digest cron (Fix 126 / Fix 138).
+        """
+        import datetime as _dt
+
+        qs = request.rel_url.query
+        now = _dt.datetime.now(_dt.timezone.utc)
+        until_iso = now.isoformat(timespec="seconds")
+
+        since = qs.get("since")
+        if not since:
+            since = (now - _dt.timedelta(hours=24)).isoformat(timespec="seconds")
+
+        severity_filter = qs.get("severity")
+
+        try:
+            conn = self._get_errors_db()
+
+            # --- totals by severity within window (optionally filtered) ----------
+            if severity_filter:
+                totals_rows = conn.execute(
+                    "SELECT severity, SUM(count) FROM auditor_errors "
+                    "WHERE severity=? AND ts_received >= ? GROUP BY severity",
+                    (severity_filter, since),
+                ).fetchall()
+            else:
+                totals_rows = conn.execute(
+                    "SELECT severity, SUM(count) FROM auditor_errors "
+                    "WHERE ts_received >= ? GROUP BY severity",
+                    (since,),
+                ).fetchall()
+
+            totals: dict = {"info": 0, "warn": 0, "error": 0, "critical": 0}
+            for sev, cnt in totals_rows:
+                if sev in totals:
+                    totals[sev] = int(cnt or 0)
+
+            # --- totals by service × severity ------------------------------------
+            if severity_filter:
+                by_svc_rows = conn.execute(
+                    "SELECT service, severity, SUM(count) FROM auditor_errors "
+                    "WHERE severity=? AND ts_received >= ? GROUP BY service, severity",
+                    (severity_filter, since),
+                ).fetchall()
+            else:
+                by_svc_rows = conn.execute(
+                    "SELECT service, severity, SUM(count) FROM auditor_errors "
+                    "WHERE ts_received >= ? GROUP BY service, severity",
+                    (since,),
+                ).fetchall()
+
+            by_service: dict = {}
+            for svc, sev, cnt in by_svc_rows:
+                if svc not in by_service:
+                    by_service[svc] = {"info": 0, "warn": 0, "error": 0, "critical": 0}
+                if sev in by_service[svc]:
+                    by_service[svc][sev] = int(cnt or 0)
+
+            # --- top_recent: up to 5 most-recent critical or error rows ----------
+            top_severity_clause = "severity IN ('critical', 'error')"
+            if severity_filter:
+                top_severity_clause = "severity=?"
+                top_args: tuple = (severity_filter, since)
+            else:
+                top_args = (since,)
+
+            if severity_filter:
+                top_rows = conn.execute(
+                    "SELECT id, service, host, severity, message, ts_received, count "
+                    f"FROM auditor_errors WHERE {top_severity_clause} AND ts_received >= ? "
+                    "ORDER BY ts_received DESC LIMIT 5",
+                    top_args,
+                ).fetchall()
+            else:
+                top_rows = conn.execute(
+                    "SELECT id, service, host, severity, message, ts_received, count "
+                    "FROM auditor_errors WHERE severity IN ('critical','error') "
+                    "AND ts_received >= ? ORDER BY ts_received DESC LIMIT 5",
+                    (since,),
+                ).fetchall()
+
+            conn.close()
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+
+        top_cols = ["id", "service", "host", "severity", "message", "ts_received", "count"]
+        top_recent = [dict(zip(top_cols, r)) for r in top_rows]
+
+        # --- alert_rate_per_hour: total events / window_hours --------------------
+        total_events = sum(totals.values())
+        try:
+            import datetime as _dt2
+            # Parse since — strip trailing Z or +00:00 for fromisoformat compat
+            since_clean = since.replace("Z", "+00:00")
+            since_dt = _dt2.datetime.fromisoformat(since_clean)
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=_dt2.timezone.utc)
+            window_hours = (now - since_dt).total_seconds() / 3600.0
+            alert_rate = round(total_events / window_hours, 4) if window_hours > 0 else 0.0
+        except Exception:
+            alert_rate = 0.0
+
+        return web.json_response({
+            "window":  {"since": since, "until": until_iso},
+            "totals":  totals,
+            "by_service": by_service,
+            "top_recent": top_recent,
+            "alert_rate_per_hour": alert_rate,
+        })
+
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -3148,6 +3275,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # Watchdog error ingest (Fix 111 / Audit New-R1)
             self._app.router.add_post("/errors", self._handle_errors_post)
             self._app.router.add_get("/errors", self._handle_errors_get)
+            self._app.router.add_get("/errors/summary", self._handle_errors_summary_get)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
