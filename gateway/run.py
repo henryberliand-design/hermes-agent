@@ -1249,12 +1249,41 @@ class GatewayRunner:
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
         self._kanban_notifier_profile = self._active_profile_name()
+        # Gap 2: profile-discriminated session keys.
+        # _session_key_profile_name is read once at startup and passed to
+        # build_session_key / SessionStore._generate_session_key so that two
+        # profiles on the same (platform, chat_id) produce distinct session
+        # keys.  Defaults to None → "agent:main" prefix for back-compat.
+        # See gateway/session.py build_session_key and scripts/migrate_session_key_profile.py.
+        self._session_key_profile_name: Optional[str] = self._active_profile_name() or None
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
+
+        # --- Decision C: per-profile role-map capability filter (opt-in) ---
+        # Loads <profile_dir>/config/role-map.yaml + role-tools.yaml on boot.
+        # Profiles without yamls → role_map = None → legacy full-catalog.
+        # See 2026-05-14-hermes-role-map-spec.md + 2026-05-15-hermes-architecture-validation-report.md.
+        # Uses get_active_profile_name() directly (not self._active_profile_name)
+        # for portability across branches where the method may not exist.
+        try:
+            from gateway.role_map import RoleMap as _RoleMap
+            from hermes_cli.profiles import (
+                get_profile_dir as _get_profile_dir,
+                get_active_profile_name as _get_active_profile_name,
+            )
+            _pname_init = _get_active_profile_name() or "default"
+            _pdir_init = _get_profile_dir(_pname_init)
+            self.role_map = _RoleMap.from_profile_dir(_pdir_init)
+            self._role_map_profile = _pname_init  # cached for log messages
+        except Exception as _rme:
+            logger.warning("role_map init failed, defaulting to no filter: %s", _rme)
+            self.role_map = None
+            self._role_map_profile = "unknown"
+        # --- end Decision C init ---
 
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
@@ -1653,10 +1682,15 @@ class GatewayRunner:
         return self._exit_code
 
     def _session_key_for_source(self, source: SessionSource) -> str:
-        """Resolve the current session key for a source, honoring gateway config when available."""
+        """Resolve the current session key for a source, honoring gateway config when available.
+
+        Gap 2: passes ``_session_key_profile_name`` so each profile produces
+        distinct session keys even when (platform, chat_id) collide across profiles.
+        """
+        profile_name = getattr(self, "_session_key_profile_name", None)
         if hasattr(self, "session_store") and self.session_store is not None:
             try:
-                session_key = self.session_store._generate_session_key(source)
+                session_key = self.session_store._generate_session_key(source, profile_name=profile_name)
                 if isinstance(session_key, str) and session_key:
                     return session_key
             except Exception:
@@ -1666,6 +1700,7 @@ class GatewayRunner:
             source,
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+            profile_name=profile_name,
         )
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
@@ -3275,6 +3310,30 @@ class GatewayRunner:
             write_runtime_status(gateway_state="starting", exit_reason=None)
         except Exception:
             pass
+
+        # Log any active supply-chain security advisories. Operators see this
+        # in gateway.log and `hermes status` surfaces it; we do NOT block
+        # startup or surface it inline to user messages, since the gateway
+        # operator is the one who can act on it (uninstall the package,
+        # rotate credentials).  See hermes_cli/security_advisories.py.
+        try:
+            from hermes_cli.security_advisories import (
+                detect_compromised,
+                gateway_log_message,
+            )
+            _adv_hits = detect_compromised()
+            _adv_msg = gateway_log_message(_adv_hits)
+            if _adv_msg:
+                logger.warning("%s", _adv_msg)
+                logger.warning(
+                    "Run `hermes doctor` on the gateway host for full "
+                    "remediation steps."
+                )
+        except Exception:
+            logger.debug(
+                "security advisory check failed at gateway startup",
+                exc_info=True,
+            )
         
         # Warn if no user allowlists are configured and open access is not opted in
         _builtin_allowed_vars = (
@@ -10203,6 +10262,24 @@ class GatewayRunner:
 
             from hermes_cli.tools_config import _get_platform_tools
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+
+            # --- Decision C: role-map catalog filter (background-task dispatch) ---
+            # Mirror of the main dispatch path filter (~line 14189). Same role_map
+            # instance; same toolset-granularity filtering.
+            if getattr(self, "role_map", None) is not None:
+                _ep = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+                _id = str(source.user_id) if getattr(source, "user_id", None) is not None else ""
+                _ch = str(source.chat_id) if getattr(source, "chat_id", None) is not None else "*"
+                _role = self.role_map.resolve_role(_ep, _id, _ch)
+                _before = len(enabled_toolsets)
+                enabled_toolsets = self.role_map.filter_catalog(enabled_toolsets, _role)
+                logger.debug(
+                    "role-map active (bg-task): profile=%s entry_point=%s identity=%s channel=%s role=%s catalog_before=%d catalog_after=%d",
+                    getattr(self, "_role_map_profile", "unknown"), _ep, _id, _ch, _role,
+                    _before, len(enabled_toolsets),
+                )
+            # --- end Decision C filter ---
+
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -14135,6 +14212,24 @@ class GatewayRunner:
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+
+        # --- Decision C: role-map catalog filter (opt-in; no-op if role_map is None) ---
+        # Filters at the toolset granularity (matches _get_platform_tools output).
+        # role-tools.yaml in profile dir must use toolset names, not individual tool names.
+        if getattr(self, "role_map", None) is not None:
+            _ep = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+            _id = str(source.user_id) if getattr(source, "user_id", None) is not None else ""
+            _ch = str(source.chat_id) if getattr(source, "chat_id", None) is not None else "*"
+            _role = self.role_map.resolve_role(_ep, _id, _ch)
+            _before = len(enabled_toolsets)
+            enabled_toolsets = self.role_map.filter_catalog(enabled_toolsets, _role)
+            logger.debug(
+                "role-map active: profile=%s entry_point=%s identity=%s channel=%s role=%s catalog_before=%d catalog_after=%d",
+                getattr(self, "_role_map_profile", "unknown"), _ep, _id, _ch, _role,
+                _before, len(enabled_toolsets),
+            )
+        # --- end Decision C filter ---
+
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 

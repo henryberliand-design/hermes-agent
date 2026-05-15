@@ -774,6 +774,66 @@ class APIServerAdapter(BasePlatformAdapter):
         return raw, None
 
     # ------------------------------------------------------------------
+    # CF Access JWT helpers (Gap 1 — server-derived identity)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_cf_jwt_sub(request: "web.Request") -> Optional[str]:
+        """Extract the ``sub`` claim from a Cloudflare Access JWT.
+
+        The JWT in ``Cf-Access-Jwt-Assertion`` has already been validated at
+        the CF edge before the request reaches this server.  We do NOT re-verify
+        the signature here — we rely on the perimeter guarantee.  We only decode
+        the payload to extract the stable ``sub`` (email or opaque ID) so we can
+        derive a server-side session identity.
+
+        Returns the ``sub`` string on success, or ``None`` if the header is
+        absent, malformed, or lacks a ``sub`` claim.
+
+        NOTE: this is intentionally a best-effort decode.  A missing or
+        unparseable JWT falls through to the Bearer-token-only path (local dev /
+        non-CF deployments) rather than hard-rejecting the request.
+        """
+        raw_jwt = request.headers.get("Cf-Access-Jwt-Assertion", "").strip()
+        if not raw_jwt:
+            return None
+
+        try:
+            import base64
+            # JWT is three dot-separated base64url segments: header.payload.sig
+            parts = raw_jwt.split(".")
+            if len(parts) != 3:
+                return None
+
+            # Base64url decode payload (add padding as needed)
+            payload_b64 = parts[1]
+            padding = 4 - len(payload_b64) % 4
+            if padding != 4:
+                payload_b64 += "=" * padding
+            payload_bytes = base64.urlsafe_b64decode(payload_b64)
+            payload = json.loads(payload_bytes.decode("utf-8"))
+            sub = payload.get("sub") or payload.get("email")
+            if sub and isinstance(sub, str):
+                return sub
+        except Exception:
+            pass
+        return None
+
+    def _derive_session_id_from_cf_jwt(self, cf_sub: str, route: str) -> str:
+        """Build a deterministic, server-derived session ID from JWT identity.
+
+        Format: ``api_server:<cf_sub>:<route_hash>``
+
+        The route hash is a short fingerprint of the endpoint path so that
+        different API routes for the same user produce distinct sessions.
+        The full sub is included verbatim so operators can grep state.db by
+        email without decoding hashes.
+        """
+        route_hash = hashlib.sha1(route.encode(), usedforsecurity=False).hexdigest()[:8]
+        safe_sub = re.sub(r"[^a-zA-Z0-9@._+-]", "_", cf_sub)
+        return f"api_server:{safe_sub}:{route_hash}"
+
+    # ------------------------------------------------------------------
     # Session DB helper
     # ------------------------------------------------------------------
 
@@ -908,6 +968,96 @@ class APIServerAdapter(BasePlatformAdapter):
             ],
         })
 
+    async def _handle_debug_role_map(self, request: "web.Request") -> "web.Response":
+        """GET /debug/role-map — expose Decision C role-map resolution for review.
+
+        Query params (all optional):
+          entry_point   default "api_server"
+          identity      default = CF JWT sub if present, else "anonymous"
+          channel       default "*"
+
+        Returns: {role_map_active, profile, entry_point, identity, channel,
+                  resolved_role, allowed_toolsets (filtered universe sample),
+                  persona_overlay}
+
+        Same Bearer-token auth as /v1/* routes. Read-only; never mutates state.
+        Per ~/Obsidian/Henry/AI Infrastructure/decisions/2026-05-14-hermes-role-map-spec.md
+        + 2026-05-15-validate-decision-c-cap-gaps.md (Decision C runtime).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        # Instantiate RoleMap directly from the active profile dir.
+        # api_server adapter doesn't carry a direct GatewayRunner reference
+        # (it uses module-level helpers from gateway.run). Re-loading the yamls
+        # on each /debug/role-map call is fine — endpoint is read-only + low-traffic.
+        from pathlib import Path
+        from gateway.role_map import RoleMap
+        from hermes_cli.profiles import get_profile_dir, get_active_profile_name
+        profile_name = get_active_profile_name() or "default"
+        try:
+            role_map = RoleMap.from_profile_dir(Path(get_profile_dir(profile_name)))
+        except Exception as exc:
+            role_map = None
+            load_error = str(exc)
+        else:
+            load_error = None
+
+        # Query params with safe defaults
+        entry_point = request.query.get("entry_point", "api_server")
+        # If no identity supplied, try CF JWT sub (gap-1 helper, may not exist on Oracle).
+        identity = request.query.get("identity")
+        if not identity:
+            try:
+                cf_sub = self._extract_cf_jwt_sub(request)
+                identity = cf_sub or "anonymous"
+            except Exception:
+                identity = "anonymous"
+        channel = request.query.get("channel", "*")
+
+        # Resolve role + filter sample
+        if role_map is None:
+            return web.json_response({
+                "object": "hermes.debug.role_map",
+                "role_map_active": False,
+                "profile": profile_name,
+                "load_error": load_error,
+                "note": "role_map = None on this profile (yamls absent OR init failed). Legacy full-catalog dispatch.",
+            })
+
+        try:
+            resolved_role = role_map.resolve_role(entry_point, identity, channel)
+            # Sample filter against a representative toolset universe
+            sample_universe = [
+                "memory", "hermes-cli", "telegram", "web", "code_execution",
+                "terminal", "browser", "delegate_to_subagent", "cronjob_create",
+                "vision", "image_generation", "tts", "weather", "github",
+                "jiddlers", "obsidian", "google_workspace",
+            ]
+            allowed = role_map.filter_catalog(sample_universe, resolved_role)
+            persona_overlay = role_map.persona_overlay(resolved_role)
+        except Exception as exc:
+            return web.json_response({
+                "object": "hermes.debug.role_map",
+                "role_map_active": True,
+                "error": str(exc),
+            }, status=500)
+
+        return web.json_response({
+            "object": "hermes.debug.role_map",
+            "role_map_active": True,
+            "profile": profile_name,
+            "entry_point": entry_point,
+            "identity": identity,
+            "channel": channel,
+            "resolved_role": resolved_role,
+            "allowed_from_sample_universe": allowed,
+            "sample_universe_size": len(sample_universe),
+            "persona_overlay": persona_overlay,
+            "note": "Read-only debug endpoint. Sample universe is illustrative — production filter uses _get_platform_tools() output.",
+        })
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -1032,15 +1182,54 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
-        # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
-        # When provided, history is loaded from state.db instead of from the request body.
+        # ------------------------------------------------------------------
+        # Session identity resolution (Gap 1 fix)
         #
-        # Security: session continuation exposes conversation history, so it is
-        # only allowed when the API key is configured and the request is
-        # authenticated.  Without this gate, any unauthenticated client could
-        # read arbitrary session history by guessing/enumerating session IDs.
+        # Priority order (highest to lowest):
+        #   1. CF Access JWT present  → derive session_id server-side from JWT
+        #      sub.  Any caller-supplied X-Hermes-Session-Id is IGNORED when a
+        #      JWT is present; it cannot override a server-derived identity.
+        #   2. X-Hermes-Session-Id header + API key auth  → session continuation
+        #      (existing behaviour, preserved for local-dev / non-CF paths).
+        #   3. Fingerprint of (system_prompt, first_user_message)  → stateless
+        #      open-WebUI path (existing behaviour).
+        #
+        # The CF-JWT path closes the cross-tenant impersonation hole: a caller
+        # with the Bearer token for profile A cannot hijack profile B's session
+        # by sending X-Hermes-Session-Id: <profile-B-session>.  When CF Access
+        # is in the path, the JWT is server-supplied and non-spoofable.
+        # ------------------------------------------------------------------
+        cf_sub = self._extract_cf_jwt_sub(request)
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
-        if provided_session_id:
+
+        if cf_sub:
+            # Server-derived identity — caller cannot influence session_id.
+            route = request.path
+            session_id = self._derive_session_id_from_cf_jwt(cf_sub, route)
+            if provided_session_id and provided_session_id != session_id:
+                logger.warning(
+                    "X-Hermes-Session-Id %r overridden by CF JWT identity for sub=%r; "
+                    "derived session_id=%r. Cross-tenant impersonation attempt blocked.",
+                    provided_session_id, cf_sub, session_id,
+                )
+            # Load history from state.db for this server-derived id (best-effort).
+            try:
+                db = self._ensure_session_db()
+                if db is not None:
+                    jwt_history = db.get_messages_as_conversation(session_id)
+                    if jwt_history:
+                        history = jwt_history
+            except Exception as e:
+                logger.warning("Failed to load CF-JWT session history for %s: %s", session_id, e)
+
+        elif provided_session_id:
+            # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
+            # When provided, history is loaded from state.db instead of from the request body.
+            #
+            # Security: session continuation exposes conversation history, so it is
+            # only allowed when the API key is configured and the request is
+            # authenticated.  Without this gate, any unauthenticated client could
+            # read arbitrary session history by guessing/enumerating session IDs.
             if not self._api_key:
                 logger.warning(
                     "Session continuation via X-Hermes-Session-Id rejected: "
@@ -3340,6 +3529,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            # Decision C debug endpoint — exposes role-map resolution for the calling identity.
+            # Same Bearer-token auth as /v1/* routes. Read-only; never mutates state.
+            self._app.router.add_get("/debug/role-map", self._handle_debug_role_map)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
