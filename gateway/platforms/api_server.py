@@ -968,6 +968,82 @@ class APIServerAdapter(BasePlatformAdapter):
             ],
         })
 
+    async def _handle_debug_role_map(self, request: "web.Request") -> "web.Response":
+        """GET /debug/role-map — expose Decision C role-map resolution for review.
+
+        Query params (all optional):
+          entry_point   default "api_server"
+          identity      default = CF JWT sub if present, else "anonymous"
+          channel       default "*"
+
+        Returns: {role_map_active, profile, entry_point, identity, channel,
+                  resolved_role, allowed_toolsets (filtered universe sample),
+                  persona_overlay}
+
+        Same Bearer-token auth as /v1/* routes. Read-only; never mutates state.
+        Per ~/Obsidian/Henry/AI Infrastructure/decisions/2026-05-14-hermes-role-map-spec.md
+        + 2026-05-15-validate-decision-c-cap-gaps.md (Decision C runtime).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        runner = self._runner
+        role_map = getattr(runner, "role_map", None)
+
+        # Query params with safe defaults
+        entry_point = request.query.get("entry_point", "api_server")
+        # If no identity supplied, try CF JWT sub (gap-1 helper, may not exist on Oracle).
+        identity = request.query.get("identity")
+        if not identity:
+            try:
+                cf_sub = self._extract_cf_jwt_sub(request)
+                identity = cf_sub or "anonymous"
+            except Exception:
+                identity = "anonymous"
+        channel = request.query.get("channel", "*")
+
+        # Resolve role + filter sample
+        if role_map is None:
+            return web.json_response({
+                "object": "hermes.debug.role_map",
+                "role_map_active": False,
+                "profile": getattr(runner, "_role_map_profile", "unknown"),
+                "note": "role_map = None on this profile (yamls absent OR init failed). Legacy full-catalog dispatch.",
+            })
+
+        try:
+            resolved_role = role_map.resolve_role(entry_point, identity, channel)
+            # Sample filter against a representative toolset universe
+            sample_universe = [
+                "memory", "hermes-cli", "telegram", "web", "code_execution",
+                "terminal", "browser", "delegate_to_subagent", "cronjob_create",
+                "vision", "image_generation", "tts", "weather", "github",
+                "jiddlers", "obsidian", "google_workspace",
+            ]
+            allowed = role_map.filter_catalog(sample_universe, resolved_role)
+            persona_overlay = role_map.persona_overlay(resolved_role)
+        except Exception as exc:
+            return web.json_response({
+                "object": "hermes.debug.role_map",
+                "role_map_active": True,
+                "error": str(exc),
+            }, status=500)
+
+        return web.json_response({
+            "object": "hermes.debug.role_map",
+            "role_map_active": True,
+            "profile": getattr(runner, "_role_map_profile", "unknown"),
+            "entry_point": entry_point,
+            "identity": identity,
+            "channel": channel,
+            "resolved_role": resolved_role,
+            "allowed_from_sample_universe": allowed,
+            "sample_universe_size": len(sample_universe),
+            "persona_overlay": persona_overlay,
+            "note": "Read-only debug endpoint. Sample universe is illustrative — production filter uses _get_platform_tools() output.",
+        })
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -3439,6 +3515,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
+            # Decision C debug endpoint — exposes role-map resolution for the calling identity.
+            # Same Bearer-token auth as /v1/* routes. Read-only; never mutates state.
+            self._app.router.add_get("/debug/role-map", self._handle_debug_role_map)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
