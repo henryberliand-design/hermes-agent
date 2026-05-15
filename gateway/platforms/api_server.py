@@ -988,8 +988,21 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
-        runner = self._runner
-        role_map = getattr(runner, "role_map", None)
+        # Instantiate RoleMap directly from the active profile dir.
+        # api_server adapter doesn't carry a direct GatewayRunner reference
+        # (it uses module-level helpers from gateway.run). Re-loading the yamls
+        # on each /debug/role-map call is fine — endpoint is read-only + low-traffic.
+        from pathlib import Path
+        from gateway.role_map import RoleMap
+        from hermes_cli.profiles import get_profile_dir, get_active_profile_name
+        profile_name = get_active_profile_name() or "default"
+        try:
+            role_map = RoleMap.from_profile_dir(Path(get_profile_dir(profile_name)))
+        except Exception as exc:
+            role_map = None
+            load_error = str(exc)
+        else:
+            load_error = None
 
         # Query params with safe defaults
         entry_point = request.query.get("entry_point", "api_server")
@@ -1008,7 +1021,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response({
                 "object": "hermes.debug.role_map",
                 "role_map_active": False,
-                "profile": getattr(runner, "_role_map_profile", "unknown"),
+                "profile": profile_name,
+                "load_error": load_error,
                 "note": "role_map = None on this profile (yamls absent OR init failed). Legacy full-catalog dispatch.",
             })
 
@@ -1033,7 +1047,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({
             "object": "hermes.debug.role_map",
             "role_map_active": True,
-            "profile": getattr(runner, "_role_map_profile", "unknown"),
+            "profile": profile_name,
             "entry_point": entry_point,
             "identity": identity,
             "channel": channel,
