@@ -997,6 +997,21 @@ class GatewayRunner:
         # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
 
+        # --- Decision C: per-profile role-map capability filter (opt-in) ---
+        # Loads <profile_dir>/config/role-map.yaml + role-tools.yaml on boot.
+        # Profiles without yamls → role_map = None → legacy full-catalog.
+        # See 2026-05-14-hermes-role-map-spec.md + 2026-05-15-hermes-architecture-validation-report.md.
+        try:
+            from gateway.role_map import RoleMap as _RoleMap
+            from hermes_cli.profiles import get_profile_dir as _get_profile_dir
+            _pname_init = self._active_profile_name() or "default"
+            _pdir_init = _get_profile_dir(_pname_init)
+            self.role_map = _RoleMap.from_profile_dir(_pdir_init)
+        except Exception as _rme:
+            logger.warning("role_map init failed, defaulting to no filter: %s", _rme)
+            self.role_map = None
+        # --- end Decision C init ---
+
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
         self._failed_platforms: Dict[Platform, Dict[str, Any]] = {}
@@ -8463,6 +8478,24 @@ class GatewayRunner:
 
             from hermes_cli.tools_config import _get_platform_tools
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+
+            # --- Decision C: role-map catalog filter (background-task dispatch) ---
+            # Mirror of the main dispatch path filter (~line 14189). Same role_map
+            # instance; same toolset-granularity filtering.
+            if getattr(self, "role_map", None) is not None:
+                _ep = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+                _id = str(source.user_id) if getattr(source, "user_id", None) is not None else ""
+                _ch = str(source.chat_id) if getattr(source, "chat_id", None) is not None else "*"
+                _role = self.role_map.resolve_role(_ep, _id, _ch)
+                _before = len(enabled_toolsets)
+                enabled_toolsets = self.role_map.filter_catalog(enabled_toolsets, _role)
+                logger.debug(
+                    "role-map active (bg-task): profile=%s entry_point=%s identity=%s channel=%s role=%s catalog_before=%d catalog_after=%d",
+                    self._active_profile_name(), _ep, _id, _ch, _role,
+                    _before, len(enabled_toolsets),
+                )
+            # --- end Decision C filter ---
+
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -11659,6 +11692,24 @@ class GatewayRunner:
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+
+        # --- Decision C: role-map catalog filter (opt-in; no-op if role_map is None) ---
+        # Filters at the toolset granularity (matches _get_platform_tools output).
+        # role-tools.yaml in profile dir must use toolset names, not individual tool names.
+        if getattr(self, "role_map", None) is not None:
+            _ep = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+            _id = str(source.user_id) if getattr(source, "user_id", None) is not None else ""
+            _ch = str(source.chat_id) if getattr(source, "chat_id", None) is not None else "*"
+            _role = self.role_map.resolve_role(_ep, _id, _ch)
+            _before = len(enabled_toolsets)
+            enabled_toolsets = self.role_map.filter_catalog(enabled_toolsets, _role)
+            logger.debug(
+                "role-map active: profile=%s entry_point=%s identity=%s channel=%s role=%s catalog_before=%d catalog_after=%d",
+                self._active_profile_name(), _ep, _id, _ch, _role,
+                _before, len(enabled_toolsets),
+            )
+        # --- end Decision C filter ---
+
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 

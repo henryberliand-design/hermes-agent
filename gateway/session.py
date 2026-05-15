@@ -595,6 +595,7 @@ def build_session_key(
     source: SessionSource,
     group_sessions_per_user: bool = True,
     thread_sessions_per_user: bool = False,
+    profile_name: Optional[str] = None,
 ) -> str:
     """Build a deterministic session key from a message source.
 
@@ -618,7 +619,23 @@ def build_session_key(
       - Without participant identifiers, or when isolation is disabled, messages fall back to one
         shared session per chat.
       - Without identifiers, messages fall back to one session per platform/chat_type.
+
+    Gap 2 (profile discriminator):
+      ``profile_name`` injects the active profile slug into the key prefix so
+      that two profiles on the same (platform, chat_id) produce distinct session
+      keys.  When ``profile_name`` is None or "default" the prefix remains the
+      legacy ``agent:main`` so existing ``state.db`` rows continue to match.
+
+      See ``scripts/migrate_session_key_profile.py`` for the migration script
+      that rewrites existing rows when a profile name is first set.
     """
+    # Build the prefix: "agent:<profile_name>" when a non-default profile is
+    # supplied, falling back to "agent:main" for back-compat.
+    if profile_name and profile_name not in ("default", "main", ""):
+        prefix = f"agent:{profile_name}"
+    else:
+        prefix = "agent:main"
+
     platform = source.platform.value
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
@@ -627,11 +644,11 @@ def build_session_key(
 
         if dm_chat_id:
             if source.thread_id:
-                return f"agent:main:{platform}:dm:{dm_chat_id}:{source.thread_id}"
-            return f"agent:main:{platform}:dm:{dm_chat_id}"
+                return f"{prefix}:{platform}:dm:{dm_chat_id}:{source.thread_id}"
+            return f"{prefix}:{platform}:dm:{dm_chat_id}"
         if source.thread_id:
-            return f"agent:main:{platform}:dm:{source.thread_id}"
-        return f"agent:main:{platform}:dm"
+            return f"{prefix}:{platform}:dm:{source.thread_id}"
+        return f"{prefix}:{platform}:dm"
 
     participant_id = source.user_id_alt or source.user_id
     if participant_id and source.platform == Platform.WHATSAPP:
@@ -639,7 +656,7 @@ def build_session_key(
         # single group member gets two isolated per-user sessions when the
         # bridge reshuffles alias forms.
         participant_id = canonical_whatsapp_identifier(str(participant_id)) or participant_id
-    key_parts = ["agent:main", platform, source.chat_type]
+    key_parts = [prefix, platform, source.chat_type]
 
     if source.chat_id:
         key_parts.append(source.chat_id)
@@ -735,12 +752,22 @@ class SessionStore:
                 logger.debug("Could not remove temp file %s: %s", tmp_path, e)
             raise
     
-    def _generate_session_key(self, source: SessionSource) -> str:
-        """Generate a session key from a source."""
+    def _generate_session_key(
+        self,
+        source: SessionSource,
+        profile_name: Optional[str] = None,
+    ) -> str:
+        """Generate a session key from a source.
+
+        ``profile_name`` is forwarded to ``build_session_key`` so the key
+        includes the profile discriminator (Gap 2 fix).  When ``None`` the
+        legacy ``agent:main`` prefix is used for backward compatibility.
+        """
         return build_session_key(
             source,
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+            profile_name=profile_name,
         )
     
     def _is_session_expired(self, entry: SessionEntry) -> bool:
@@ -764,12 +791,12 @@ class SessionStore:
 
         now = _now()
 
-        if policy.mode in ("idle", "both"):
+        if policy.mode in {"idle", "both"}:
             idle_deadline = entry.updated_at + timedelta(minutes=policy.idle_minutes)
             if now > idle_deadline:
                 return True
 
-        if policy.mode in ("daily", "both"):
+        if policy.mode in {"daily", "both"}:
             today_reset = now.replace(
                 hour=policy.at_hour,
                 minute=0, second=0, microsecond=0,
@@ -805,12 +832,12 @@ class SessionStore:
         
         now = _now()
         
-        if policy.mode in ("idle", "both"):
+        if policy.mode in {"idle", "both"}:
             idle_deadline = entry.updated_at + timedelta(minutes=policy.idle_minutes)
             if now > idle_deadline:
                 return "idle"
         
-        if policy.mode in ("daily", "both"):
+        if policy.mode in {"daily", "both"}:
             today_reset = now.replace(
                 hour=policy.at_hour, 
                 minute=0, 
@@ -1086,19 +1113,22 @@ class SessionStore:
         return len(removed_keys)
 
     def suspend_recently_active(self, max_age_seconds: int = 120) -> int:
-        """Mark recently-active sessions as suspended.
+        """Mark recently-active sessions as resumable after an unexpected exit.
 
-        Called on gateway startup to prevent sessions that were likely
-        in-flight when the gateway last exited from being blindly resumed
-        (#7536).  Only suspends sessions updated within *max_age_seconds*
-        to avoid resetting long-idle sessions that are harmless to resume.
-        Returns the number of sessions that were suspended.
+        Called on gateway startup after a crash or fast restart to preserve
+        in-flight sessions instead of destroying their conversation history
+        (#7536).  Only marks sessions updated within *max_age_seconds* to
+        avoid touching long-idle sessions.  Sets ``resume_pending=True`` so
+        the next incoming message on the same session_key auto-resumes from
+        the existing transcript.
 
-        Entries flagged ``resume_pending=True`` are skipped — those were
-        marked intentionally by the drain-timeout path as recoverable.
-        Terminal escalation for genuinely stuck ``resume_pending`` sessions
-        is handled by the existing ``.restart_failure_counts`` stuck-loop
-        counter, which runs after this method on startup.
+        Entries already flagged ``resume_pending=True`` are skipped.  Entries
+        explicitly ``suspended=True`` (from /stop or stuck-loop escalation)
+        are also skipped.  Terminal escalation for genuinely stuck sessions
+        is still handled by the existing ``.restart_failure_counts`` counter
+        (threshold 3), which runs after this method and sets ``suspended=True``.
+
+        Returns the number of sessions marked resumable.
         """
         from datetime import timedelta
 
@@ -1110,13 +1140,15 @@ class SessionStore:
                 if entry.resume_pending:
                     continue
                 if not entry.suspended and entry.updated_at >= cutoff:
-                    entry.suspended = True
+                    entry.resume_pending = True
+                    entry.resume_reason = "restart_interrupted"
+                    entry.last_resume_marked_at = _now()
                     count += 1
             if count:
                 self._save()
         return count
 
-    def reset_session(self, session_key: str) -> Optional[SessionEntry]:
+    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         db_end_session_id = None
         db_create_kwargs = None
@@ -1140,7 +1172,7 @@ class SessionStore:
                 created_at=now,
                 updated_at=now,
                 origin=old_entry.origin,
-                display_name=old_entry.display_name,
+                display_name=display_name if display_name is not None else old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
@@ -1271,8 +1303,14 @@ class SessionStore:
         
         # Also write legacy JSONL (keeps existing tooling working during transition)
         transcript_path = self.get_transcript_path(session_id)
-        with open(transcript_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(message, ensure_ascii=False) + "\n")
+        try:
+            with self._lock:
+                with open(transcript_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(message, ensure_ascii=False) + "\n")
+        except OSError as e:
+            # Disk full / read-only fs / permission errors must not crash the
+            # message handler — the SQLite write above is the primary store.
+            logger.debug("Failed to write JSONL transcript for %s: %s", session_id, e)
     
     def rewrite_transcript(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Replace the entire transcript for a session with new messages.
