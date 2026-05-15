@@ -1249,6 +1249,13 @@ class GatewayRunner:
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
         self._kanban_notifier_profile = self._active_profile_name()
+        # Gap 2: profile-discriminated session keys.
+        # _session_key_profile_name is read once at startup and passed to
+        # build_session_key / SessionStore._generate_session_key so that two
+        # profiles on the same (platform, chat_id) produce distinct session
+        # keys.  Defaults to None → "agent:main" prefix for back-compat.
+        # See gateway/session.py build_session_key and scripts/migrate_session_key_profile.py.
+        self._session_key_profile_name: Optional[str] = self._active_profile_name() or None
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None
@@ -1653,10 +1660,15 @@ class GatewayRunner:
         return self._exit_code
 
     def _session_key_for_source(self, source: SessionSource) -> str:
-        """Resolve the current session key for a source, honoring gateway config when available."""
+        """Resolve the current session key for a source, honoring gateway config when available.
+
+        Gap 2: passes ``_session_key_profile_name`` so each profile produces
+        distinct session keys even when (platform, chat_id) collide across profiles.
+        """
+        profile_name = getattr(self, "_session_key_profile_name", None)
         if hasattr(self, "session_store") and self.session_store is not None:
             try:
-                session_key = self.session_store._generate_session_key(source)
+                session_key = self.session_store._generate_session_key(source, profile_name=profile_name)
                 if isinstance(session_key, str) and session_key:
                     return session_key
             except Exception:
@@ -1666,6 +1678,7 @@ class GatewayRunner:
             source,
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+            profile_name=profile_name,
         )
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
