@@ -1267,15 +1267,22 @@ class GatewayRunner:
         # Loads <profile_dir>/config/role-map.yaml + role-tools.yaml on boot.
         # Profiles without yamls → role_map = None → legacy full-catalog.
         # See 2026-05-14-hermes-role-map-spec.md + 2026-05-15-hermes-architecture-validation-report.md.
+        # Uses get_active_profile_name() directly (not self._active_profile_name)
+        # for portability across branches where the method may not exist.
         try:
             from gateway.role_map import RoleMap as _RoleMap
-            from hermes_cli.profiles import get_profile_dir as _get_profile_dir
-            _pname_init = self._active_profile_name() or "default"
+            from hermes_cli.profiles import (
+                get_profile_dir as _get_profile_dir,
+                get_active_profile_name as _get_active_profile_name,
+            )
+            _pname_init = _get_active_profile_name() or "default"
             _pdir_init = _get_profile_dir(_pname_init)
             self.role_map = _RoleMap.from_profile_dir(_pdir_init)
+            self._role_map_profile = _pname_init  # cached for log messages
         except Exception as _rme:
             logger.warning("role_map init failed, defaulting to no filter: %s", _rme)
             self.role_map = None
+            self._role_map_profile = "unknown"
         # --- end Decision C init ---
 
         # Track platforms that failed to connect for background reconnection.
@@ -10268,7 +10275,7 @@ class GatewayRunner:
                 enabled_toolsets = self.role_map.filter_catalog(enabled_toolsets, _role)
                 logger.debug(
                     "role-map active (bg-task): profile=%s entry_point=%s identity=%s channel=%s role=%s catalog_before=%d catalog_after=%d",
-                    self._active_profile_name(), _ep, _id, _ch, _role,
+                    getattr(self, "_role_map_profile", "unknown"), _ep, _id, _ch, _role,
                     _before, len(enabled_toolsets),
                 )
             # --- end Decision C filter ---
@@ -14218,7 +14225,7 @@ class GatewayRunner:
             enabled_toolsets = self.role_map.filter_catalog(enabled_toolsets, _role)
             logger.debug(
                 "role-map active: profile=%s entry_point=%s identity=%s channel=%s role=%s catalog_before=%d catalog_after=%d",
-                self._active_profile_name(), _ep, _id, _ch, _role,
+                getattr(self, "_role_map_profile", "unknown"), _ep, _id, _ch, _role,
                 _before, len(enabled_toolsets),
             )
         # --- end Decision C filter ---
