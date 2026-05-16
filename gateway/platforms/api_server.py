@@ -742,6 +742,62 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         return None  # UID validated
+    @staticmethod
+    def _extract_cf_jwt_sub(request: "web.Request") -> Optional[str]:
+        """Extract the ``sub`` claim from a Cloudflare Access JWT.
+
+        The JWT in ``Cf-Access-Jwt-Assertion`` has already been validated at
+        the CF edge before the request reaches this server.  We do NOT re-verify
+        the signature here — we rely on the perimeter guarantee.  We only decode
+        the payload to extract the stable ``sub`` (email or opaque ID) so we can
+        derive a server-side session identity.
+
+        Returns the ``sub`` string on success, or ``None`` if the header is
+        absent, malformed, or lacks a ``sub`` claim.
+
+        NOTE: this is intentionally a best-effort decode.  A missing or
+        unparseable JWT falls through to the Bearer-token-only path (local dev /
+        non-CF deployments) rather than hard-rejecting the request.
+        """
+        raw_jwt = request.headers.get("Cf-Access-Jwt-Assertion", "").strip()
+        if not raw_jwt:
+            return None
+
+        try:
+            import base64
+            # JWT is three dot-separated base64url segments: header.payload.sig
+            parts = raw_jwt.split(".")
+            if len(parts) != 3:
+                return None
+
+            # Base64url decode payload (add padding as needed)
+            payload_b64 = parts[1]
+            padding = 4 - len(payload_b64) % 4
+            if padding != 4:
+                payload_b64 += "=" * padding
+            payload_bytes = base64.urlsafe_b64decode(payload_b64)
+            payload = json.loads(payload_bytes.decode("utf-8"))
+            sub = payload.get("sub") or payload.get("email")
+            if sub and isinstance(sub, str):
+                return sub
+        except Exception:
+            pass
+        return None
+
+    def _derive_session_id_from_cf_jwt(self, cf_sub: str, route: str) -> str:
+        """Build a deterministic, server-derived session ID from JWT identity.
+
+        Format: ``api_server:<cf_sub>:<route_hash>``
+
+        The route hash is a short fingerprint of the endpoint path so that
+        different API routes for the same user produce distinct sessions.
+        The full sub is included verbatim so operators can grep state.db by
+        email without decoding hashes.
+        """
+        route_hash = hashlib.sha1(route.encode(), usedforsecurity=False).hexdigest()[:8]
+        safe_sub = re.sub(r"[^a-zA-Z0-9@._+-]", "_", cf_sub)
+        return f"api_server:{safe_sub}:{route_hash}"
+
 
     # ------------------------------------------------------------------
     # Session DB helper
