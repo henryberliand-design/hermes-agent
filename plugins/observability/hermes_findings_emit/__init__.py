@@ -53,8 +53,13 @@ SOURCE_APP = os.environ.get(
 VECTOS_BRIDGE_TOKEN = os.environ.get("VECTOS_BRIDGE_TOKEN", "")
 VECTOS_KANBAN_BASE = os.environ.get(
     "VECTOS_KANBAN_BASE",
-    "https://vectos.berl.ai/api/plugins/kanban/tasks",
+    "http://127.0.0.1:3002/api/plugins/kanban/tasks",
 )
+# Try prod first, fall back to dev. Comma-separated env override supported.
+VECTOS_KANBAN_BASES = [u.strip() for u in os.environ.get(
+    "VECTOS_KANBAN_BASES",
+    "http://127.0.0.1:3002/api/plugins/kanban/tasks,http://127.0.0.1:3005/api/plugins/kanban/tasks",
+).split(",") if u.strip()]
 
 # ── Two-row pattern: process-local span start-time store ────────────────────
 # Keyed by span_id string. Survives within one subprocess — that is enough
@@ -158,37 +163,51 @@ def _vectos_patch(card_id: str, status: str, description: Optional[str] = None) 
         )
         return
 
-    url = f"{VECTOS_KANBAN_BASE}/{card_id}"
     payload: Dict[str, Any] = {"status": status}
     if description:
         payload["description"] = description[:1000]
-
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="PATCH",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {VECTOS_BRIDGE_TOKEN}",
-            "User-Agent": "hermes-findings-emit/v3",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            logger.info(
-                "hermes_findings_emit: reverse-PATCH card=%s status=%s http=%d",
-                card_id, status, resp.status,
-            )
-    except urllib.error.HTTPError as e:
-        logger.warning(
-            "hermes_findings_emit: reverse-PATCH HTTP error card=%s status=%s code=%d body=%s",
-            card_id, status, e.code, e.read()[:200],
+    succeeded = False
+    last_err = None
+    for base in VECTOS_KANBAN_BASES:
+        url = f"{base}/{card_id}"
+        req = urllib.request.Request(
+            url, data=data, method="PATCH",
+            headers={
+                "Content-Type": "application/json",
+                "X-Service-Token": VECTOS_BRIDGE_TOKEN,
+                "cf-access-authenticated-user-email": "henry@berliand.com",
+                "User-Agent": "hermes-findings-emit/v3",
+            },
         )
-    except Exception as e:
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                logger.info(
+                    "hermes_findings_emit: reverse-PATCH card=%s status=%s http=%d via=%s",
+                    card_id, status, resp.status, base,
+                )
+                succeeded = True
+                break
+        except urllib.error.HTTPError as e:
+            last_err = (base, e.code, e.read()[:200])
+            if e.code == 404:
+                continue
+            logger.warning(
+                "hermes_findings_emit: reverse-PATCH HTTP error card=%s status=%s code=%d via=%s body=%s",
+                card_id, status, e.code, base, last_err[2],
+            )
+            break
+        except Exception as e:
+            last_err = (base, 0, str(e))
+            logger.warning(
+                "hermes_findings_emit: reverse-PATCH failed card=%s via=%s: %s",
+                card_id, base, e,
+            )
+            break
+    if not succeeded and last_err:
         logger.warning(
-            "hermes_findings_emit: reverse-PATCH failed card=%s: %s",
-            card_id, e,
+            "hermes_findings_emit: reverse-PATCH exhausted bases for card=%s last=%s",
+            card_id, last_err,
         )
 
 
@@ -201,10 +220,11 @@ def _handle_kanban_terminal(tool_name: str, args: Any) -> None:
         args.get("kanban_task_id")
         or args.get("task_id")
         or args.get("card_id")
+        or os.environ.get("HERMES_KANBAN_TASK", "")
         or ""
     ).strip()
     if not card_id:
-        logger.debug("hermes_findings_emit: kanban tool %s has no card_id in args", tool_name)
+        logger.debug("hermes_findings_emit: kanban tool %s has no card_id (args or env)", tool_name)
         return
 
     if tool_name == "kanban_complete":
